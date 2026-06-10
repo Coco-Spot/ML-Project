@@ -7,6 +7,7 @@ machine. Optional heavy dependencies are imported lazily.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import numpy as np
 import os
 from pathlib import Path
 import shutil
@@ -99,7 +100,7 @@ class FunASR:
 class MockDiarizer:
     name = "mock_diarizer"
 
-    def label(self, transcript: Transcript, speakers: int) -> Transcript:
+    def label(self, transcript: Transcript, speakers: int, **kwargs) -> Transcript:
         labeled = []
         for index, segment in enumerate(transcript.segments):
             speaker_id = index % max(speakers, 1) + 1
@@ -173,6 +174,132 @@ class MockLLMRefiner:
         return text
 
 
+class SpeechBrainDiarizer:
+    """Real speaker diarization using SpeechBrain speaker embeddings and
+    agglomerative clustering on ASR segment boundaries.
+
+    This follows the same approach validated in ``xutong_code/重叠/chongdie.py``
+    but integrated into the project's provider interface so the ``diarization_asr``
+    pipeline produces genuine speaker labels instead of round-robin mock labels.
+    """
+
+    name = "speechbrain_diarizer"
+
+    def __init__(self) -> None:
+        self._encoder = None
+        self._torch = None
+        self._cluster = None
+        self._device = "cpu"
+
+    def _lazy_load(self) -> None:
+        if self._encoder is not None:
+            return
+        try:
+            from speechbrain.inference.speaker import SpeakerRecognition
+        except ImportError:
+            from speechbrain.pretrained import SpeakerRecognition
+
+        import sklearn.cluster as sklearn_cluster
+        import torch
+
+        self._torch = torch
+        self._cluster = sklearn_cluster
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._encoder = SpeakerRecognition.from_hparams(
+            source="speechbrain/spkrec-xvect-voxceleb",
+            savedir="pretrained_spkrec-xvect-voxceleb",
+            run_opts={"device": self._device},
+        )
+
+    def label(
+        self,
+        transcript: Transcript,
+        speakers: int,
+        audio_path: Path | None = None,
+    ) -> Transcript:
+        """Label each ASR segment with a speaker tag.
+
+        When *audio_path* is available and the file exists, the method loads the
+        waveform, extracts a speaker embedding (x-vector) for every segment,
+        then runs agglomerative clustering to assign speaker identities.
+
+        Short segments (``< 0.1 s``) are skipped during embedding extraction
+        and receive a fallback round-robin label so the return always contains
+        every original segment.
+
+        Falls back to :class:`MockDiarizer` when the audio file is unavailable
+        or dependencies cannot be loaded.
+        """
+        try:
+            self._lazy_load()
+        except Exception:
+            return MockDiarizer().label(transcript, speakers)
+
+        if audio_path is None or not audio_path.exists():
+            return MockDiarizer().label(transcript, speakers)
+
+        import librosa
+
+        y, sr = librosa.load(str(audio_path), sr=16000)
+
+        # --- extract speaker embeddings per segment ---------------------------
+        embeddings: list[np.ndarray] = []
+        valid_indices: list[int] = []
+        for idx, seg in enumerate(transcript.segments):
+            start = int(float(seg["start"]) * sr)
+            end = int(float(seg["end"]) * sr)
+            if end - start < int(0.1 * sr):
+                continue
+            segment_wav = y[start:end]
+            with self._torch.no_grad():
+                emb = self._encoder.encode_batch(
+                    self._torch.tensor(segment_wav)
+                    .unsqueeze(0)
+                    .to(self._device)
+                )
+                emb = emb.squeeze().cpu().numpy()
+            embeddings.append(emb)
+            valid_indices.append(idx)
+
+        # --- cluster embeddings -----------------------------------------------
+        n_valid = len(embeddings)
+        if n_valid >= 2:
+            n_clusters = min(max(speakers, 1), n_valid)
+            clustering = self._cluster.AgglomerativeClustering(
+                n_clusters=n_clusters, metric="cosine", linkage="average"
+            )
+            cluster_ids = clustering.fit_predict(np.array(embeddings))
+        elif n_valid == 1:
+            cluster_ids = [0]
+        else:
+            cluster_ids = []
+
+        # --- map cluster ids -> SPEAKER labels --------------------------------
+        cluster_to_speaker: dict[int, str] = {}
+        label_for_idx: dict[int, str] = {}
+        for embedding_pos, transcript_idx in enumerate(valid_indices):
+            cid = int(cluster_ids[embedding_pos])
+            if cid not in cluster_to_speaker:
+                cluster_to_speaker[cid] = f"SPEAKER{len(cluster_to_speaker) + 1}"
+            label_for_idx[transcript_idx] = cluster_to_speaker[cid]
+
+        # --- build output transcript ------------------------------------------
+        fallback_count = 0
+        labeled_segments: list[dict[str, object]] = []
+        for idx, seg in enumerate(transcript.segments):
+            if idx in label_for_idx:
+                speaker = label_for_idx[idx]
+            else:
+                speaker = f"SPEAKER{fallback_count % max(speakers, 1) + 1}"
+                fallback_count += 1
+            labeled_segments.append({**seg, "speaker": speaker})
+
+        text = " ".join(
+            f"[{seg['speaker']}] {seg['text']}" for seg in labeled_segments
+        )
+        return Transcript(text=text, segments=labeled_segments)
+
+
 def make_asr(kind: str):
     if kind == "mock":
         return MockASR()
@@ -188,6 +315,8 @@ def make_asr(kind: str):
 def make_diarizer(kind: str):
     if kind == "mock":
         return MockDiarizer()
+    if kind == "speechbrain":
+        return SpeechBrainDiarizer()
     raise ValueError(f"Unsupported diarization provider: {kind}")
 
 

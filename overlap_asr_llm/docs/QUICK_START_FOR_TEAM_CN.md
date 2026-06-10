@@ -170,7 +170,7 @@ configs/experiment.json
 
 ```text
 ASR:        mock, whisper, whisper:<model-name>, funasr
-Diarizer:   mock
+Diarizer:   mock, speechbrain
 Separator:  mock, sepformer, sepformer:<huggingface-model-id>
 LLM:        mock
 ```

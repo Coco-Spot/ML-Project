@@ -8,7 +8,7 @@ before submission.
 | Member 1 | Literature review and research question | Paper notes, related-work slides | 16.7% |
 | Member 2 | Dataset construction and annotation | Audio samples, overlap labels, references | 16.7% |
 | Member 3 | Direct ASR baseline | Baseline code, WER/CER table | 16.7% |
-| Member 4 | Separation and diarization | SepFormer/diarization code, comparison table | 16.7% |
+| Member 4 | Separation and diarization | SpeechBrainDiarizer provider (`providers.py`), clustering-based speaker labeling, tests (`test_diarizer.py`), SepFormer separation code | 16.7% |
 | Member 5 | LLM/RAG refinement | Prompt, glossary, refined transcripts | 16.7% |
 | Member 6 | Video, README, final packaging | Demo video, final zip, GitHub cleanup | 16.5% |
 
