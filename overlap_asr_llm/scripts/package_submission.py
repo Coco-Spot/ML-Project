@@ -19,6 +19,16 @@ EXTRA_PACKAGE_FILES = (
     REPOSITORY_ROOT / "README.md",
     REPOSITORY_ROOT / "Makefile",
 )
+EXTRA_PACKAGE_DIRS = (
+    REPOSITORY_ROOT / "image",
+)
+EXTRA_PACKAGE_SUFFIXES = {
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".webp",
+}
 SKIP_PARTS = {
     "__pycache__",
     ".pytest_cache",
@@ -121,6 +131,13 @@ def package_paths() -> list[Path]:
         if path != ARCHIVE and path.is_file() and not should_skip(path)
     ]
     package_files.extend(path for path in EXTRA_PACKAGE_FILES if path.is_file())
+    for directory in EXTRA_PACKAGE_DIRS:
+        if directory.is_dir():
+            package_files.extend(
+                path
+                for path in sorted(directory.rglob("*"))
+                if path.is_file() and path.suffix.lower() in EXTRA_PACKAGE_SUFFIXES
+            )
     return sorted(package_files)
 
 
