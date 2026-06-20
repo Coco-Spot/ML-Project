@@ -107,6 +107,47 @@ pip install -e .
 Real ASR, diarization, separation, and readability evaluation may require GPU
 memory, large model downloads, and API credentials.
 
+## Docker
+
+The Dockerfile lives in `overlap_asr_llm/Dockerfile` and is meant to give the
+instructor a reproducible way to run tests, mock workflows, or the frontend
+without manually configuring Python dependencies.
+
+Build the full image from the repository root:
+
+```bash
+docker build -t overlap-asr-llm ./overlap_asr_llm
+```
+
+Run the default unit-test check:
+
+```bash
+docker run --rm overlap-asr-llm
+```
+
+Run the lightweight mock pipeline:
+
+```bash
+docker run --rm overlap-asr-llm \
+  python -m overlap_asr_llm.cli run --config configs/mock.json --mock
+```
+
+Run the frontend on `http://127.0.0.1:7861`:
+
+```bash
+docker run --rm -p 7861:7861 overlap-asr-llm \
+  python scripts/launch_speaker_app.py --host 0.0.0.0 --port 7861
+```
+
+For real-model experiments, pass credentials as environment variables or mount
+a local `.env` file. Do not bake secrets or downloaded model caches into the
+image.
+
+```bash
+docker run --rm --env-file overlap_asr_llm/.env overlap-asr-llm \
+  python -m overlap_asr_llm.cli run --config configs/all_pipelines.json --incremental
+```
+
 ## Environment Setup
 
 Before running real-model experiments or the frontend, create
