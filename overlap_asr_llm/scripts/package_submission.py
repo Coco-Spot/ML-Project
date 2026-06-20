@@ -13,7 +13,12 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ARCHIVE = ROOT / "overlap_asr_llm_submission.zip"
+REPOSITORY_ROOT = ROOT.parent
+ARCHIVE = ROOT / "overlap_asr_llm_project.zip"
+EXTRA_PACKAGE_FILES = (
+    REPOSITORY_ROOT / "README.md",
+    REPOSITORY_ROOT / "Makefile",
+)
 SKIP_PARTS = {
     "__pycache__",
     ".pytest_cache",
@@ -27,6 +32,7 @@ SKIP_PARTS = {
     ".vscode",
     "models",
     "checkpoints",
+    "server_experiments",
 }
 SKIP_FILENAMES = {
     ".DS_Store",
@@ -109,11 +115,13 @@ def should_skip(path: Path) -> bool:
 
 
 def package_paths() -> list[Path]:
-    return [
+    package_files = [
         path
         for path in sorted(ROOT.rglob("*"))
         if path != ARCHIVE and path.is_file() and not should_skip(path)
     ]
+    package_files.extend(path for path in EXTRA_PACKAGE_FILES if path.is_file())
+    return sorted(package_files)
 
 
 def build_parser() -> argparse.ArgumentParser:
