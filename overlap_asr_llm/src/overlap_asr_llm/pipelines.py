@@ -20,6 +20,7 @@ _SUBTITLE_PREFIX_RE = re.compile(
     r"\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s*"
 )
 _SPEAKER_PREFIX_RE = re.compile(r"^\s*\[[^\]]+\]\s*")
+_MIN_TURN_ASR_SECONDS = 0.2
 
 
 class ProviderCache:
@@ -308,9 +309,14 @@ def _transcribe_speaker_turns(
         for index, turn in enumerate(ordered_turns, start=1):
             start = float(turn.get("start", 0.0))
             end = float(turn.get("end", start))
+            if end - start < _MIN_TURN_ASR_SECONDS:
+                continue
             excerpt_path = tmp_path / f"turn_{index:04d}.wav"
             _write_audio_excerpt(audio_path, start, end, excerpt_path)
-            transcript = asr.transcribe(excerpt_path, language, prompt=prompt)
+            try:
+                transcript = asr.transcribe(excerpt_path, language, prompt=prompt)
+            except Exception:
+                continue
             text = transcript.text.strip()
             if not text:
                 text = " ".join(
@@ -693,21 +699,39 @@ def _run_source_pipeline(
 
 def run_all(config: ExperimentConfig) -> list[PipelineResult]:
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    providers = ProviderCache(config)
     results: list[PipelineResult] = []
-    for sample in config.samples:
-        if "direct_asr" in config.pipelines:
-            results.append(run_direct_asr(config, sample, providers))
-        if "diarization_asr" in config.pipelines:
-            results.append(run_diarization_asr(config, sample, providers))
-        if "diarization_turn_asr" in config.pipelines:
-            results.append(run_diarization_turn_asr(config, sample, providers))
-        if "separation_asr" in config.pipelines:
-            results.append(run_separation_asr(config, sample, providers))
-        if "llm_rag_refine" in config.pipelines:
-            if config.llm_rag_sources:
-                for source in config.llm_rag_sources:
-                    results.append(run_llm_rag_refine_from_source(config, sample, source))
-            else:
-                results.append(run_llm_rag_refine(config, sample, results, providers))
+    asr_models = config.asr_models or [config.models.get("asr", "mock")]
+    for asr_model in asr_models:
+        model_config = replace(
+            config,
+            models={**config.models, "asr": asr_model},
+            asr_models=[asr_model],
+        )
+        providers = ProviderCache(model_config)
+        for sample in model_config.samples:
+            sample_results: list[PipelineResult] = []
+            if "direct_asr" in model_config.pipelines:
+                result = run_direct_asr(model_config, sample, providers)
+                results.append(result)
+                sample_results.append(result)
+            if "diarization_asr" in model_config.pipelines:
+                result = run_diarization_asr(model_config, sample, providers)
+                results.append(result)
+                sample_results.append(result)
+            if "diarization_turn_asr" in model_config.pipelines:
+                result = run_diarization_turn_asr(model_config, sample, providers)
+                results.append(result)
+                sample_results.append(result)
+            if "separation_asr" in model_config.pipelines:
+                result = run_separation_asr(model_config, sample, providers)
+                results.append(result)
+                sample_results.append(result)
+            if "llm_rag_refine" in model_config.pipelines:
+                if model_config.llm_rag_sources:
+                    for source in model_config.llm_rag_sources:
+                        results.append(run_llm_rag_refine_from_source(model_config, sample, source))
+                else:
+                    results.append(
+                        run_llm_rag_refine(model_config, sample, sample_results, providers)
+                    )
     return results

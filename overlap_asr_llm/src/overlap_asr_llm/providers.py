@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 
 
@@ -211,21 +212,79 @@ class FunASR:
         prompt: str | None = None,
     ) -> Transcript:
         del language, prompt
-        result = self.model.generate(input=str(audio_path), batch_size=1, return_raw=True)[0]
+        result = self.model.generate(
+            input=str(audio_path),
+            batch_size=1,
+            return_raw=True,
+            timestamp=True,
+        )[0]
         text = str(result.get("text", "")).strip()
-        raw_segments = result.get("sentences") or [
-            {"start": 0.0, "end": 0.0, "text": text}
-        ]
+        raw_segments = (
+            result.get("sentences")
+            or result.get("sentence_info")
+            or self._segments_from_timestamps(result, text)
+            or [{"start": 0.0, "end": 0.0, "text": text}]
+        )
         segments = [
             {
-                "start": float(segment.get("start", 0.0)),
-                "end": float(segment.get("end", 0.0)),
+                "start": self._timestamp_seconds(segment.get("start", 0.0)),
+                "end": self._timestamp_seconds(segment.get("end", 0.0)),
                 "text": str(segment.get("text", "")).strip(),
-                "speaker": "UNKNOWN",
+                "speaker": str(segment.get("speaker", segment.get("spk", "UNKNOWN"))),
             }
             for segment in raw_segments
         ]
         return Transcript(text=text, segments=segments)
+
+    @staticmethod
+    def _timestamp_seconds(value: object) -> float:
+        seconds = float(value or 0.0)
+        return seconds / 1000.0 if seconds > 100 else seconds
+
+    def _segments_from_timestamps(
+        self,
+        result: dict[str, object],
+        text: str,
+    ) -> list[dict[str, object]]:
+        timestamps = result.get("timestamp") or result.get("timestamps")
+        if not isinstance(timestamps, list) or not timestamps:
+            return []
+
+        pairs = [
+            item
+            for item in timestamps
+            if isinstance(item, (list, tuple)) and len(item) >= 2
+        ]
+        chars = [char for char in text.replace(" ", "") if char.strip()]
+        if not pairs or not chars:
+            return []
+        if len(pairs) != len(chars):
+            return [
+                {
+                    "start": pairs[0][0],
+                    "end": pairs[-1][1],
+                    "text": text,
+                }
+            ]
+
+        segments = []
+        start = pairs[0][0]
+        chunk = []
+        for index, (char, pair) in enumerate(zip(chars, pairs)):
+            chunk.append(char)
+            is_boundary = char in "。！？!?；;，," or len(chunk) >= 30
+            if is_boundary or index == len(chars) - 1:
+                segments.append(
+                    {
+                        "start": start,
+                        "end": pair[1],
+                        "text": "".join(chunk),
+                    }
+                )
+                if index + 1 < len(pairs):
+                    start = pairs[index + 1][0]
+                chunk = []
+        return segments
 
 
 class MockDiarizer:
@@ -302,7 +361,10 @@ class PyannoteDiarizer:
         if self.device.startswith("cuda"):
             self.pipeline.to(self.torch.device(self.device))
         kwargs = {"num_speakers": int(speakers)} if int(speakers) > 0 else {}
-        diarization_result = self.pipeline({"audio": str(audio_path)}, **kwargs)
+        diarization_result = self.pipeline(
+            self._audio_input(audio_path),
+            **kwargs,
+        )
         diarization = self._speaker_diarization_annotation(diarization_result)
         return [
             {
@@ -345,6 +407,28 @@ class PyannoteDiarizer:
     @staticmethod
     def _speaker_diarization_annotation(diarization_result):
         return getattr(diarization_result, "speaker_diarization", diarization_result)
+
+    def _audio_input(self, audio_path: Path) -> dict[str, object]:
+        try:
+            waveform, sample_rate = self._load_waveform(audio_path)
+        except Exception:
+            return {"audio": str(audio_path), "uri": audio_path.stem}
+        return {
+            "waveform": waveform,
+            "sample_rate": sample_rate,
+            "uri": audio_path.stem,
+        }
+
+    def _load_waveform(self, audio_path: Path):
+        import soundfile as sf
+
+        data, sample_rate = sf.read(
+            str(audio_path),
+            always_2d=True,
+            dtype="float32",
+        )
+        waveform = self.torch.from_numpy(data.T).contiguous()
+        return waveform, int(sample_rate)
 
     def _best_speaker(
         self,
@@ -608,36 +692,37 @@ class ClearVoiceSeparator:
 
     def separate(self, audio_path: Path, output_dir: Path, speakers: int) -> list[Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
-        required_sources = max(speakers, 1)
         raw_output_dir = output_dir / "clearvoice_raw"
         self.model(str(audio_path), online_write=True, output_path=str(raw_output_dir))
 
         outputs = []
-        for source_idx in range(required_sources):
-            source = self._find_clearvoice_output(
-                raw_output_dir,
-                audio_path.stem,
-                source_idx + 1,
-            )
-            target = output_dir / f"speaker_{source_idx + 1}.wav"
+        for source_idx, source in enumerate(
+            self._find_clearvoice_outputs(raw_output_dir, audio_path.stem),
+            start=1,
+        ):
+            target = output_dir / f"speaker_{source_idx}.wav"
             shutil.copyfile(source, target)
             outputs.append(target)
         shutil.rmtree(raw_output_dir, ignore_errors=True)
         return outputs
 
-    def _find_clearvoice_output(
+    def _find_clearvoice_outputs(
         self,
         raw_output_dir: Path,
         audio_stem: str,
-        source_index: int,
-    ) -> Path:
-        candidates = sorted(raw_output_dir.rglob(f"{audio_stem}_s{source_index}.*"))
+    ) -> list[Path]:
+        pattern = re.compile(rf"^{re.escape(audio_stem)}_s(\d+)\.")
+        candidates = []
+        for path in raw_output_dir.rglob(f"{audio_stem}_s*.*"):
+            match = pattern.match(path.name)
+            if path.is_file() and match:
+                candidates.append((int(match.group(1)), path))
         if candidates:
-            return candidates[0]
+            return [path for _, path in sorted(candidates)]
         all_outputs = sorted(raw_output_dir.rglob("*"))
         files = [path for path in all_outputs if path.is_file()]
         raise RuntimeError(
-            f"ClearVoice did not write source {source_index} for {audio_stem}. "
+            f"ClearVoice did not write separated sources for {audio_stem}. "
             f"Found files: {[path.as_posix() for path in files]}"
         )
 

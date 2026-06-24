@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from html import escape
 import json
+import os
 from pathlib import Path
 
 from .pipelines import PipelineResult
@@ -278,6 +279,11 @@ def write_separation_segments(
 
 
 def write_summary(results: list[PipelineResult], path: Path) -> None:
+    html_path = path.with_suffix(".html")
+    write_html = os.environ.get("OVERLAP_ASR_LLM_WRITE_HTML_SUMMARY") == "1"
+    if not write_html:
+        html_path.unlink(missing_ok=True)
+
     if results and all(result.pipeline == "diarization_asr" for result in results):
         write_diarization_summary(results, path)
         return
@@ -287,7 +293,8 @@ def write_summary(results: list[PipelineResult], path: Path) -> None:
 
     lines = _comparison_summary_lines(results)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    _write_summary_html(results, path.with_suffix(".html"))
+    if write_html:
+        _write_summary_html(results, html_path)
 
 
 def _comparison_summary_lines(results: list[PipelineResult]) -> list[str]:

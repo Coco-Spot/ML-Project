@@ -131,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     config = load_config(args.config)
-    models = args.models or config.asr_models or ["funasr", f"whisper:{args.whisper_model}"]
+    models = args.models or config.asr_models or ["funasr"]
     output_path = (
         Path(args.output).resolve()
         if args.output
