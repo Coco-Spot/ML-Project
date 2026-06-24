@@ -58,3 +58,5 @@ checkpoints/
 .vscode/
 .idea/
 .DS_Store
+
+sever_outputs/

@@ -8,10 +8,16 @@ import unittest
 from overlap_asr_llm.config import LLMRAGSource, load_config
 from overlap_asr_llm.cli import _load_env_file
 from overlap_asr_llm.io import write_results
-from overlap_asr_llm.pipelines import _refined_text_for_scoring, run_all
+from overlap_asr_llm.pipelines import (
+    _refined_text_for_scoring,
+    _transcribe_speaker_turns,
+    run_all,
+)
 from overlap_asr_llm.providers import (
     DEFAULT_PYANNOTE_DIARIZATION_MODEL,
+    ClearVoiceSeparator,
     PyannoteDiarizer,
+    Transcript,
     _load_pyannote_pipeline,
     _prepare_huggingface_download_env,
 )
@@ -86,6 +92,20 @@ class TestRunner(unittest.TestCase):
             results = run_all(config)
         self.assertEqual(len(results), len(config.samples))
         self.assertEqual({result.pipeline for result in results}, {"direct_asr"})
+
+    def test_single_config_can_compare_multiple_asr_models(self):
+        config = load_config(Path("configs/mock.json"))
+        config.models.update(
+            {"asr": "mock", "diarization": "mock", "separation": "mock", "llm": "mock"}
+        )
+        config.pipelines[:] = ["direct_asr"]
+        config.asr_models[:] = ["mock", "mock"]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = replace(config, output_dir=Path(tmpdir))
+            results = run_all(config)
+        self.assertEqual(len(results), len(config.samples) * 2)
+        self.assertEqual({result.pipeline for result in results}, {"direct_asr"})
+        self.assertEqual([result.model for result in results].count("mock"), len(results))
 
     def test_llm_rag_only_can_compare_hidden_diarization_sources(self):
         config = load_config(Path("configs/mock.json"))
@@ -171,6 +191,19 @@ class TestRunner(unittest.TestCase):
             "pyannote/speaker-diarization-community-1",
         )
 
+    def test_pyannote_diarizer_preloads_waveform_input(self):
+        diarizer = PyannoteDiarizer.__new__(PyannoteDiarizer)
+        import torch
+
+        waveform = torch.zeros(1, 16000)
+        diarizer._load_waveform = lambda audio_path: (waveform, 16000)
+        audio_input = diarizer._audio_input(Path("data/samples2/no_overlap.wav"))
+
+        self.assertIs(audio_input["waveform"], waveform)
+        self.assertEqual(audio_input["sample_rate"], 16000)
+        self.assertEqual(audio_input["uri"], "no_overlap")
+        self.assertNotIn("audio", audio_input)
+
     def test_mock_diarization_adds_speaker_labels(self):
         config = load_config(Path("configs/mock.json"))
         config.models.update(
@@ -183,6 +216,39 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(len(results), len(config.samples))
         self.assertEqual({result.pipeline for result in results}, {"diarization_asr"})
         self.assertTrue(all("SPEAKER" in result.speaker_labels for result in results))
+
+    def test_turn_transcription_skips_short_and_failed_turns(self):
+        class FlakyASR:
+            name = "flaky_asr"
+
+            def __init__(self):
+                self.calls = 0
+
+            def transcribe(self, audio_path, language, prompt=None):
+                del audio_path, language, prompt
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("empty model input")
+                return Transcript(
+                    text="ok",
+                    segments=[{"start": 0.0, "end": 0.5, "text": "ok"}],
+                )
+
+        turns = [
+            {"start": 0.0, "end": 0.05, "speaker": "SPEAKER0"},
+            {"start": 1.0, "end": 1.5, "speaker": "SPEAKER1"},
+            {"start": 2.0, "end": 2.5, "speaker": "SPEAKER2"},
+        ]
+        segments = _transcribe_speaker_turns(
+            FlakyASR(),
+            Path("data/samples2/no_overlap.wav"),
+            turns,
+            "zh",
+        )
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["speaker"], "SPEAKER2")
+        self.assertEqual(segments[0]["text"], "ok")
 
     def test_mock_turn_level_diarization_asr_is_separate_pipeline(self):
         config = load_config(Path("configs/mock.json"))
@@ -197,6 +263,28 @@ class TestRunner(unittest.TestCase):
         self.assertEqual({result.pipeline for result in results}, {"diarization_turn_asr"})
         self.assertTrue(all("turn_asr" in result.model for result in results))
         self.assertTrue(all("SPEAKER" in result.speaker_labels for result in results))
+
+    def test_clearvoice_separator_uses_actual_output_source_count(self):
+        class FakeClearVoiceModel:
+            def __call__(self, audio_path, online_write, output_path):
+                raw_dir = Path(output_path) / "MossFormer2_SS_16K"
+                raw_dir.mkdir(parents=True)
+                stem = Path(audio_path).stem
+                (raw_dir / f"{stem}_s2.wav").write_bytes(b"source-two")
+                (raw_dir / f"{stem}_s1.wav").write_bytes(b"source-one")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            audio_path = tmp_path / "meeting.wav"
+            audio_path.write_bytes(b"audio")
+            separator = ClearVoiceSeparator.__new__(ClearVoiceSeparator)
+            separator.model = FakeClearVoiceModel()
+            outputs = separator.separate(audio_path, tmp_path / "separated", speakers=4)
+
+            self.assertEqual([path.name for path in outputs], ["speaker_1.wav", "speaker_2.wav"])
+            self.assertEqual(outputs[0].read_bytes(), b"source-one")
+            self.assertEqual(outputs[1].read_bytes(), b"source-two")
+            self.assertFalse((tmp_path / "separated" / "clearvoice_raw").exists())
 
     def test_pyannote_diarizer_accepts_diarize_output_wrapper(self):
         annotation = object()
